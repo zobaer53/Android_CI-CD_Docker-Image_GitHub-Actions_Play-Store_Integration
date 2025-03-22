@@ -1,0 +1,202 @@
+name: Build Docker Image and Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'  # Run only on version tags
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (debug or release)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      deploy_to_play_store:
+        description: 'Deploy to Play Store'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build_and_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # This is needed for access to the repository
+      packages: write  # This is needed for pushing to GHCR
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # Fetch all history and tags
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    # Before logging in, add labels to the image to link it to the repository
+    - name: Lowercase the repository name
+      run: |
+        echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+    
+    - name: Log in to the Container registry
+      uses: docker/login-action@v2
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Determine build type
+      id: build_type
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "BUILD_TYPE=${{ github.event.inputs.build_type }}" >> $GITHUB_ENV
+        elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          echo "BUILD_TYPE=release" >> $GITHUB_ENV
+        else
+          echo "BUILD_TYPE=debug" >> $GITHUB_ENV
+        fi
+        echo "Selected build type: ${{ env.BUILD_TYPE }}"
+    
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ghcr.io/${{ env.REPO_LC }}
+        tags: |
+          type=raw,value=latest
+          type=sha,format=short
+          type=semver,pattern={{version}}
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.description=Calculator App Docker Image
+    
+    - name: Build and push Docker image
+      id: docker_build
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_TYPE=${{ env.BUILD_TYPE }}
+    
+    # Create the keystore directory and file
+    - name: Setup Keystore for Release Build
+      if: env.BUILD_TYPE == 'release'
+      run: |
+        # Create src directory if it doesn't exist
+        mkdir -p src
+        
+        # Get the upload keystore from GitHub secrets
+        # You'll need to add a UPLOAD_KEYSTORE secret that contains the base64-encoded keystore
+        if [ -n "${{ secrets.UPLOAD_KEYSTORE }}" ]; then
+          echo "Using the upload keystore from GitHub secrets..."
+          echo "${{ secrets.UPLOAD_KEYSTORE }}" | base64 --decode > src/upload-keystore.jks
+          
+          # Create a keystore.properties file with the keystore info
+          echo "storeFile=../src/upload-keystore.jks" > keystore.properties
+          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}" >> keystore.properties
+          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> keystore.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> keystore.properties
+        else
+          # Fallback: Create a temporary upload keystore
+          echo "WARNING: Using a temporary upload keystore. This will not match your Play Store upload key."
+          keytool -genkey -v -keystore src/upload-keystore.jks -alias upload \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass upload123 -keypass upload123 \
+            -dname "CN=Upload Key, OU=Development, O=Example, L=City, S=State, C=US"
+          
+          # Create a keystore.properties file with the keystore info
+          echo "storeFile=../src/upload-keystore.jks" > keystore.properties
+          echo "storePassword=upload123" >> keystore.properties
+          echo "keyAlias=upload" >> keystore.properties
+          echo "keyPassword=upload123" >> keystore.properties
+        fi
+        
+        # List the files to verify
+        ls -la src/
+        echo "Keystore properties created"
+    
+    # Print git information for debugging
+    - name: Debug Git Info
+      run: |
+        echo "Git reference: ${{ github.ref }}"
+        echo "Git ref name: ${{ github.ref_name }}"
+        echo "Git commit: ${{ github.sha }}"
+        git describe --tags --abbrev=0 || echo "No tags found"
+        git rev-list --count HEAD
+
+    # Build AAB directly in the GitHub Actions runner
+    - name: Build AAB for Play Store
+      run: |
+        # Set up JDK for building APK
+        echo "Building APK/AAB directly in the GitHub Actions runner"
+        java -version
+        
+        # Make Gradle wrapper executable
+        chmod +x ./gradlew
+        
+        # Set CI environment variable to trigger special signing in build.gradle.kts
+        export CI=true
+        
+        # Pass version information to Gradle
+        export GITHUB_REF="${{ github.ref }}"
+        
+        # Create a placeholder service account credentials file
+        echo '{"type":"service_account"}' > play-account-key.json
+        chmod 644 play-account-key.json
+        
+        # Build the debug APK if needed
+        if [[ "${{ env.BUILD_TYPE }}" == "debug" ]]; then
+          echo "Building debug APK with auto-incremented version"
+          ./gradlew assembleDebug --no-daemon --info
+        fi
+        
+        # List build outputs
+        echo "Build outputs:"
+        find app/build/outputs -type f -name "*.aab" -o -name "*.apk" | sort 2>/dev/null || echo "No outputs found yet"
+    
+    # Build release bundle in a separate step
+    - name: Build Release Bundle
+      if: env.BUILD_TYPE == 'release'
+      env:
+        ANDROID_PUBLISHER_CREDENTIALS: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+      run: |
+        echo "Building release AAB with version from tag: ${{ github.ref_name }}"
+        ./gradlew bundleRelease --no-daemon --info
+        
+        # List build outputs
+        echo "Release bundle outputs:"
+        find app/build/outputs -type f -name "*.aab" | sort
+    
+    # Deploy to Play Store if this is a tag push or manual trigger  
+    - name: Deploy to Play Store
+      if: (startsWith(github.ref, 'refs/tags/') || github.event.inputs.deploy_to_play_store == 'true') && env.BUILD_TYPE == 'release'
+      env:
+        ANDROID_PUBLISHER_CREDENTIALS: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+      run: |
+        echo "Using ANDROID_PUBLISHER_CREDENTIALS environment variable"
+        
+        # Check if the PLAY_SERVICE_ACCOUNT_JSON secret is set
+        if [ -z "$ANDROID_PUBLISHER_CREDENTIALS" ]; then
+          echo "ERROR: PLAY_SERVICE_ACCOUNT_JSON secret is not set or empty"
+          exit 1
+        fi
+        
+        # Verify that the credentials look like JSON (starts with '{')
+        if [[ "$ANDROID_PUBLISHER_CREDENTIALS" != {* ]]; then
+          echo "ERROR: PLAY_SERVICE_ACCOUNT_JSON does not appear to be valid JSON. It should start with '{'."
+          exit 1
+        fi
+        
+        # Run the publish task with debug to get more info
+        ./gradlew publishReleaseBundle --stacktrace --debug
+        
+        echo "App bundle published to Play Store internal testing track" 
