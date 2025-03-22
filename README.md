@@ -1,3 +1,4 @@
+![zeDMoviesApp](https://github.com/zobaer53/Android_CI-CD_Docker-Image_GitHub-Actions_Play-Store_Integration/blob/master/Add%20a%20heading.png)
 # Setting Up GitHub Actions CI/CD for Android Apps with Google Play Store Integration Using GitHub Container Registry (GHCR) - Free Tier Guide
 
 
@@ -77,5 +78,5 @@ The GitHub Actions workflow:
 4. Creates a GitHub Release if a tag is pushed
 5. Uploads the APK as an artifact
 
-For more details, see [.github/workflows/docker-build-push.yml](.github/workflows/docker-build-push.yml).
+For more details, see [medium article](https://medium.com/@zobaer53/setting-up-github-actions-ci-cd-for-android-apps-using-github-container-registry-ghcr-f0f5fbea512b).
 
